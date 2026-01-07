@@ -10,6 +10,9 @@ import io
 import wave
 import subprocess
 import os
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 # Server configuration (must match config.yaml server.port)
 API_BASE_URL = "http://localhost:8005"
@@ -33,6 +36,62 @@ LANGUAGES = [
     ("Hindi", "hi"),
     ("Auto-detect", "auto"),
 ]
+
+
+@dataclass
+class StreamingSession:
+    """Manages WebSocket connection for streaming transcription."""
+    ws: Optional[object] = None  # WebSocket connection (avoiding deprecated type hint)
+    connected: bool = False
+    latest_text: str = ""
+    audio_buffer: bytearray = field(default_factory=bytearray)
+    start_time: float = 0.0
+    stop_time: float = 0.0
+
+
+# Global streaming session (persists across .stream() calls)
+_streaming_session: Optional[StreamingSession] = None
+
+
+def _convert_audio_chunk(audio_tuple) -> bytes:
+    """Convert Gradio audio tuple to 16kHz mono PCM bytes."""
+    if audio_tuple is None:
+        return b""
+
+    sample_rate, audio_data = audio_tuple
+
+    # Convert to mono if stereo
+    if len(audio_data.shape) > 1:
+        audio_data = audio_data.mean(axis=1)
+
+    # Resample to 16kHz if needed
+    if sample_rate != 16000:
+        num_samples = int(len(audio_data) * 16000 / sample_rate)
+        audio_data = np.interp(
+            np.linspace(0, len(audio_data), num_samples),
+            np.arange(len(audio_data)),
+            audio_data
+        )
+
+    # Normalize and convert to 16-bit PCM
+    audio_data = audio_data.astype(np.float32)
+    max_val = np.abs(audio_data).max()
+    if max_val > 0:
+        audio_data = audio_data / max_val
+    audio_data = (audio_data * 32767).astype(np.int16)
+
+    return audio_data.tobytes()
+
+
+def _create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Convert PCM bytes to WAV format."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm_data)
+    return buffer.getvalue()
 
 
 def check_server_health():
@@ -326,6 +385,189 @@ def transcribe_recording(audio, mode, language_override, state):
         return transcribe_streaming(audio, state)
 
 
+# =============================================================================
+# Live Recording with Side-by-Side Comparison
+# =============================================================================
+
+async def _connect_streaming_session():
+    """Connect to WebSocket for streaming transcription."""
+    global _streaming_session
+    _streaming_session = StreamingSession()
+    _streaming_session.ws = await websockets.connect(WS_URL)
+    _streaming_session.connected = True
+    _streaming_session.start_time = time.time()
+    _streaming_session.audio_buffer = bytearray()
+    _streaming_session.latest_text = ""
+
+
+async def _send_chunk_to_ws(pcm_data: bytes):
+    """Send audio chunk to WebSocket and poll for responses."""
+    global _streaming_session
+    if _streaming_session is None or not _streaming_session.connected:
+        return ""
+
+    try:
+        await _streaming_session.ws.send(pcm_data)
+
+        # Non-blocking poll for transcription updates
+        try:
+            response = await asyncio.wait_for(
+                _streaming_session.ws.recv(),
+                timeout=0.05
+            )
+            msg = json.loads(response)
+            if msg.get("text"):
+                _streaming_session.latest_text = msg["text"]
+        except asyncio.TimeoutError:
+            pass
+
+        return _streaming_session.latest_text
+    except Exception:
+        return _streaming_session.latest_text if _streaming_session else ""
+
+
+async def _finalize_streaming():
+    """Finalize streaming session and return final transcription with latency."""
+    global _streaming_session
+    if _streaming_session is None or not _streaming_session.connected:
+        return "", 0.0
+
+    try:
+        _streaming_session.stop_time = time.time()
+        await _streaming_session.ws.send("end")
+
+        # Drain all remaining messages until final
+        while True:
+            try:
+                response = await asyncio.wait_for(
+                    _streaming_session.ws.recv(),
+                    timeout=10
+                )
+                msg = json.loads(response)
+                if msg.get("text"):
+                    _streaming_session.latest_text = msg["text"]
+                if msg.get("type") == "final" or msg.get("is_utterance_complete"):
+                    break
+            except asyncio.TimeoutError:
+                break
+            except websockets.exceptions.ConnectionClosed:
+                break
+
+        latency = time.time() - _streaming_session.stop_time
+        final_text = _streaming_session.latest_text or "No speech detected."
+
+        await _streaming_session.ws.close()
+        _streaming_session.connected = False
+
+        return final_text, latency
+
+    except Exception as e:
+        return f"Error: {str(e)}", 0.0
+
+
+def handle_stream_chunk(audio_chunk, state):
+    """
+    Handle incoming audio chunk during live recording.
+    Called by Gradio's .stream() event every 1 second.
+
+    Returns: (streaming_text, accumulated_audio, state)
+    """
+    if audio_chunk is None:
+        return "Listening...", None, state
+
+    if not check_server_health():
+        return "Error: Server not available", None, state
+
+    # Initialize state if needed
+    if state is None or not isinstance(state, dict):
+        state = {"connected": False, "audio_buffer": bytearray()}
+
+    # Convert chunk to PCM
+    pcm_chunk = _convert_audio_chunk(audio_chunk)
+
+    # Accumulate audio in state for batch processing later
+    if "audio_buffer" not in state:
+        state["audio_buffer"] = bytearray()
+    state["audio_buffer"].extend(pcm_chunk)
+
+    # Store the full audio tuple for batch processing
+    state["full_audio"] = audio_chunk
+
+    async def process_chunk():
+        global _streaming_session
+
+        # Connect on first chunk
+        if _streaming_session is None or not _streaming_session.connected:
+            await _connect_streaming_session()
+            state["connected"] = True
+
+        # Add to session buffer and send
+        _streaming_session.audio_buffer.extend(pcm_chunk)
+        text = await _send_chunk_to_ws(pcm_chunk)
+        return text
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        text = loop.run_until_complete(process_chunk())
+        loop.close()
+
+        display_text = text if text else "Listening..."
+        return display_text, audio_chunk, state
+
+    except Exception as e:
+        return f"Streaming error: {str(e)}", audio_chunk, state
+
+
+def handle_recording_stop(audio, state, language_override):
+    """
+    Handle recording stop - finalize streaming and run batch transcription.
+
+    Returns: (streaming_text, streaming_latency, batch_text, batch_latency, state)
+    """
+    if audio is None:
+        return "No audio recorded.", "Latency: --", "No audio recorded.", "Latency: --", {}
+
+    if not check_server_health():
+        err = "Error: Server not available"
+        return err, "Latency: --", err, "Latency: --", {}
+
+    # Finalize streaming transcription
+    async def finalize():
+        return await _finalize_streaming()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        streaming_text, streaming_latency = loop.run_until_complete(finalize())
+        loop.close()
+    except Exception as e:
+        streaming_text = f"Streaming error: {str(e)}"
+        streaming_latency = 0.0
+
+    # Run batch transcription
+    batch_start = time.time()
+    batch_text = transcribe_recording_batch(audio, language_override)
+    batch_latency = time.time() - batch_start
+
+    # Format latency strings
+    streaming_lat_str = f"Latency: {streaming_latency:.2f}s" if streaming_latency > 0 else "Latency: --"
+    batch_lat_str = f"Latency: {batch_latency:.2f}s"
+
+    # Reset state for next recording
+    global _streaming_session
+    _streaming_session = None
+
+    return streaming_text, streaming_lat_str, batch_text, batch_lat_str, {}
+
+
+def reset_live_outputs():
+    """Reset outputs when starting a new recording."""
+    global _streaming_session
+    _streaming_session = None
+    return "Listening...", "Latency: --", "Recording...", "Latency: --", {}
+
+
 # Build the Gradio interface
 with gr.Blocks(title="ASR Server Demo") as demo:
     gr.Markdown(
@@ -365,40 +607,76 @@ with gr.Blocks(title="ASR Server Demo") as demo:
                 outputs=[file_output]
             )
 
-        # Live Recording Tab
+        # Live Recording Tab - Side-by-Side Comparison
         with gr.TabItem("Live Recording"):
-            mode_toggle = gr.Radio(
-                choices=["Batch", "Streaming"],
-                value="Batch",
-                label="Transcription Mode",
-                info="Batch: Record then transcribe | Streaming: Transcribe as you speak"
+            gr.Markdown(
+                """
+                **Real-time comparison:** Streaming transcribes as you speak,
+                Batch transcribes after recording stops. Compare accuracy and latency!
+                """
             )
+
+            # Audio input with streaming enabled
             recording_input = gr.Audio(
-                label="Record Audio",
+                label="Record Audio (streaming enabled)",
                 type="numpy",
-                sources=["microphone"]
+                sources=["microphone"],
+                streaming=True
             )
+
             with gr.Row():
                 rec_lang_override = gr.Dropdown(
                     choices=[("Use server default", "default")] + LANGUAGES,
                     value="default",
-                    label="Language (per-request override)",
+                    label="Language",
                     scale=1
                 )
-            recording_transcribe_btn = gr.Button("Transcribe", variant="primary")
-            recording_output = gr.Textbox(
-                label="Transcription",
-                lines=5,
-                placeholder="Transcription will appear here..."
+
+            # Side-by-side outputs
+            with gr.Row():
+                with gr.Column():
+                    streaming_output = gr.Textbox(
+                        label="Streaming Output",
+                        lines=5,
+                        placeholder="Transcription appears in real-time as you speak...",
+                        interactive=False
+                    )
+                    streaming_latency = gr.Markdown("Latency: --")
+
+                with gr.Column():
+                    batch_output = gr.Textbox(
+                        label="Batch Output",
+                        lines=5,
+                        placeholder="Transcription appears after recording stops...",
+                        interactive=False
+                    )
+                    batch_latency = gr.Markdown("Latency: --")
+
+            # Hidden state for accumulated audio
+            live_state = gr.State(value={})
+            # Hidden component to accumulate audio for batch processing
+            accumulated_audio = gr.State(value=None)
+
+            # Stream event - fires every 1 second during recording
+            recording_input.stream(
+                fn=handle_stream_chunk,
+                inputs=[recording_input, live_state],
+                outputs=[streaming_output, accumulated_audio, live_state],
+                stream_every=1,
+                time_limit=300  # 5 minute max recording
             )
 
-            # State for streaming
-            stream_state = gr.State(value={})
+            # Stop recording event - finalize streaming and run batch
+            recording_input.stop_recording(
+                fn=handle_recording_stop,
+                inputs=[accumulated_audio, live_state, rec_lang_override],
+                outputs=[streaming_output, streaming_latency, batch_output, batch_latency, live_state]
+            )
 
-            recording_transcribe_btn.click(
-                fn=transcribe_recording,
-                inputs=[recording_input, mode_toggle, rec_lang_override, stream_state],
-                outputs=[recording_output, stream_state]
+            # Start recording event - reset outputs
+            recording_input.start_recording(
+                fn=reset_live_outputs,
+                outputs=[streaming_output, streaming_latency, batch_output, batch_latency, live_state]
             )
 
         # Settings Tab
