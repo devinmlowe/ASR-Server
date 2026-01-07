@@ -232,8 +232,10 @@ async def stream_transcribe(websocket: WebSocket):
 
     audio_buffer = bytearray()
     sample_rate = 16000
-    silence_threshold_ms = 500  # VAD silence threshold
     min_audio_ms = 100  # Minimum audio to process
+    # Streaming parameters tuned for accuracy
+    process_threshold_ms = 2000  # Process every 2 seconds for better context
+    overlap_ms = 500  # Keep 500ms overlap for word boundary continuity
 
     try:
         while True:
@@ -248,8 +250,8 @@ async def stream_transcribe(websocket: WebSocket):
                 # Assuming 16-bit mono PCM at 16kHz: 2 bytes per sample
                 buffer_duration_ms = (len(audio_buffer) / 2) / sample_rate * 1000
 
-                # Process when we have enough audio (at least 500ms for VAD to work)
-                if buffer_duration_ms >= 500:
+                # Process when we have enough audio (2 seconds for good context)
+                if buffer_duration_ms >= process_threshold_ms:
                     # Convert buffer to WAV format for transcriber
                     wav_data = pcm_to_wav(bytes(audio_buffer), sample_rate)
 
@@ -269,8 +271,8 @@ async def stream_transcribe(websocket: WebSocket):
                             "is_utterance_complete": False
                         })
 
-                    # Keep last 100ms for continuity, clear the rest
-                    keep_bytes = int(sample_rate * 0.1 * 2)  # 100ms at 16kHz, 16-bit
+                    # Keep last 500ms for continuity to preserve word boundaries
+                    keep_bytes = int(sample_rate * (overlap_ms / 1000) * 2)
                     audio_buffer = bytearray(audio_buffer[-keep_bytes:])
 
             elif "text" in data:
