@@ -17,6 +17,8 @@ class WhisperConfig:
     model_path: str = "models/ggml-base.bin"
     language: str = "en"
     threads: int = 4
+    backend: str = "auto"  # "auto", "coreml", or "metal"
+    cli_path: Optional[str] = None  # Path to whisper-cli binary, None = search PATH
 
 
 @dataclass

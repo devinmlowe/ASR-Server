@@ -6,6 +6,8 @@ whisper:
   model_path: "models/ggml-base.bin"
   language: "en"
   threads: 4
+  backend: "auto"  # "auto", "coreml", or "metal"
+  cli_path: "bin/whisper-cli"  # Use local build, or null for system whisper-cli
 
 vad:
   enabled: false  # Disabled until GGML VAD model available
