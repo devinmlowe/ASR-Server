@@ -269,7 +269,7 @@ async def transcribe_streaming_async(audio, state):
         audio_data = audio_data / max(np.abs(audio_data).max(), 1e-7)
         pcm_data = (audio_data * 32767).astype(np.int16).tobytes()
 
-        transcriptions = []
+        latest_transcription = ""
 
         async with websockets.connect(WS_URL) as ws:
             # Send audio in chunks
@@ -282,30 +282,25 @@ async def transcribe_streaming_async(audio, state):
                 try:
                     response = await asyncio.wait_for(ws.recv(), timeout=0.1)
                     msg = json.loads(response)
+                    # Server sends full transcription each time, just keep latest
                     if msg.get("text"):
-                        transcriptions.append(msg["text"])
+                        latest_transcription = msg["text"]
                 except asyncio.TimeoutError:
                     pass
 
             # Signal end of stream
             await ws.send("end")
 
-            # Get final transcription
+            # Get final transcription (this is the complete, authoritative result)
             try:
                 response = await asyncio.wait_for(ws.recv(), timeout=10)
                 msg = json.loads(response)
                 if msg.get("text"):
-                    transcriptions.append(msg["text"])
+                    latest_transcription = msg["text"]
             except asyncio.TimeoutError:
                 pass
 
-        # Combine transcriptions (deduplicate consecutive)
-        result = []
-        for t in transcriptions:
-            if not result or t != result[-1]:
-                result.append(t)
-
-        return " ".join(result) if result else "No speech detected.", state
+        return latest_transcription if latest_transcription else "No speech detected.", state
 
     except Exception as e:
         return f"Error: {str(e)}", state

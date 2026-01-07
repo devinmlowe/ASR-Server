@@ -233,9 +233,10 @@ async def stream_transcribe(websocket: WebSocket):
     audio_buffer = bytearray()
     sample_rate = 16000
     min_audio_ms = 100  # Minimum audio to process
-    # Streaming parameters tuned for accuracy
-    process_threshold_ms = 2000  # Process every 2 seconds for better context
-    overlap_ms = 500  # Keep 500ms overlap for word boundary continuity
+    # Streaming parameters - accumulate and re-transcribe full buffer
+    process_interval_ms = 2000  # Send updates every 2 seconds
+    last_process_length = 0  # Track last processed buffer size
+    last_transcription = ""  # Track last sent transcription for delta
 
     try:
         while True:
@@ -246,13 +247,14 @@ async def stream_transcribe(websocket: WebSocket):
                 audio_chunk = data["bytes"]
                 audio_buffer.extend(audio_chunk)
 
-                # Calculate buffer duration
+                # Calculate NEW audio since last process
                 # Assuming 16-bit mono PCM at 16kHz: 2 bytes per sample
-                buffer_duration_ms = (len(audio_buffer) / 2) / sample_rate * 1000
+                new_audio_bytes = len(audio_buffer) - last_process_length
+                new_audio_ms = (new_audio_bytes / 2) / sample_rate * 1000
 
-                # Process when we have enough audio (2 seconds for good context)
-                if buffer_duration_ms >= process_threshold_ms:
-                    # Convert buffer to WAV format for transcriber
+                # Process when we have enough NEW audio
+                if new_audio_ms >= process_interval_ms:
+                    # Transcribe the FULL buffer for context
                     wav_data = pcm_to_wav(bytes(audio_buffer), sample_rate)
 
                     # Run transcription in thread pool to not block
@@ -264,22 +266,22 @@ async def stream_transcribe(websocket: WebSocket):
                         config.whisper.language
                     )
 
-                    if result.text.strip():
+                    current_text = result.text.strip()
+                    if current_text and current_text != last_transcription:
                         await websocket.send_json({
                             "type": "partial",
-                            "text": result.text,
+                            "text": current_text,
                             "is_utterance_complete": False
                         })
+                        last_transcription = current_text
 
-                    # Keep last 500ms for continuity to preserve word boundaries
-                    keep_bytes = int(sample_rate * (overlap_ms / 1000) * 2)
-                    audio_buffer = bytearray(audio_buffer[-keep_bytes:])
+                    last_process_length = len(audio_buffer)
 
             elif "text" in data:
                 # Handle control messages
                 message = data["text"]
                 if message == "end":
-                    # Process remaining audio
+                    # Process ALL remaining audio for final transcription
                     if len(audio_buffer) > int(sample_rate * min_audio_ms / 1000 * 2):
                         wav_data = pcm_to_wav(bytes(audio_buffer), sample_rate)
                         loop = asyncio.get_event_loop()
@@ -290,10 +292,11 @@ async def stream_transcribe(websocket: WebSocket):
                             config.whisper.language
                         )
 
-                        if result.text.strip():
+                        final_text = result.text.strip()
+                        if final_text:
                             await websocket.send_json({
                                 "type": "final",
-                                "text": result.text,
+                                "text": final_text,
                                 "is_utterance_complete": True
                             })
                     break
