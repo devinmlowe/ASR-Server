@@ -1,0 +1,14 @@
+server:
+  host: "0.0.0.0"
+  port: 8005
+
+whisper:
+  model_path: "models/ggml-base.bin"
+  language: "en"
+  threads: 4
+
+vad:
+  enabled: false  # Disabled until GGML VAD model available
+  threshold: 0.5
+  min_speech_duration_ms: 250
+  min_silence_duration_ms: 700
