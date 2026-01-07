@@ -29,3 +29,7 @@ Thumbs.db
 # Temp files
 *.tmp
 *.temp
+
+# Local builds
+vendor/
+bin/
