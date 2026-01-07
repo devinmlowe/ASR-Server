@@ -1,16 +1,14 @@
 server:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8005
-
-whisper:
-  model_path: "models/ggml-base.bin"
-  language: "en"
-  threads: 4
-  backend: "auto"  # "auto", "coreml", or "metal"
-  cli_path: "bin/whisper-cli"  # Use local build, or null for system whisper-cli
-
 vad:
-  enabled: false  # Disabled until GGML VAD model available
-  threshold: 0.5
-  min_speech_duration_ms: 250
+  enabled: false
   min_silence_duration_ms: 700
+  min_speech_duration_ms: 250
+  threshold: 0.5
+whisper:
+  backend: auto
+  cli_path: bin/whisper-cli
+  language: en
+  model_path: models/ggml-medium.en.bin
+  threads: 4

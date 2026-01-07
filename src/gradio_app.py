@@ -291,13 +291,20 @@ async def transcribe_streaming_async(audio, state):
             # Signal end of stream
             await ws.send("end")
 
-            # Get final transcription (this is the complete, authoritative result)
+            # Drain all remaining messages until we get the "final" one
+            # (there may be queued partial messages)
             try:
-                response = await asyncio.wait_for(ws.recv(), timeout=10)
-                msg = json.loads(response)
-                if msg.get("text"):
-                    latest_transcription = msg["text"]
+                while True:
+                    response = await asyncio.wait_for(ws.recv(), timeout=10)
+                    msg = json.loads(response)
+                    if msg.get("text"):
+                        latest_transcription = msg["text"]
+                    # Stop when we get the final message
+                    if msg.get("type") == "final" or msg.get("is_utterance_complete"):
+                        break
             except asyncio.TimeoutError:
+                pass
+            except websockets.exceptions.ConnectionClosed:
                 pass
 
         return latest_transcription if latest_transcription else "No speech detected.", state
