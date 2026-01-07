@@ -1,0 +1,538 @@
+"""Gradio demo interface for ASR Server."""
+
+import gradio as gr
+import requests
+import websockets
+import asyncio
+import json
+import numpy as np
+import io
+import wave
+import subprocess
+import os
+
+# Server configuration (must match config.yaml server.port)
+API_BASE_URL = "http://localhost:8005"
+WS_URL = "ws://localhost:8005/v1/audio/stream"
+
+# Common language codes for Whisper
+LANGUAGES = [
+    ("English", "en"),
+    ("Spanish", "es"),
+    ("French", "fr"),
+    ("German", "de"),
+    ("Italian", "it"),
+    ("Portuguese", "pt"),
+    ("Dutch", "nl"),
+    ("Polish", "pl"),
+    ("Russian", "ru"),
+    ("Japanese", "ja"),
+    ("Chinese", "zh"),
+    ("Korean", "ko"),
+    ("Arabic", "ar"),
+    ("Hindi", "hi"),
+    ("Auto-detect", "auto"),
+]
+
+
+def check_server_health():
+    """Check if the ASR server is running."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/health", timeout=2)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
+def load_server_config():
+    """Load current config from server."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/v1/config", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except requests.exceptions.RequestException:
+        pass
+    return None
+
+
+def get_config_display():
+    """Get formatted config for display."""
+    config = load_server_config()
+    if config is None:
+        return "Server not available", "en", 4, False, 0.5, 250, 700
+
+    whisper = config.get("whisper", {})
+    vad = config.get("vad", {})
+
+    status = f"""**Server Status:** Connected
+
+**Whisper Settings:**
+- Model: `{whisper.get('model_path', 'unknown')}`
+- Language: `{whisper.get('language', 'en')}`
+- Threads: `{whisper.get('threads', 4)}`
+
+**VAD Settings:**
+- Enabled: `{vad.get('enabled', False)}`
+- Threshold: `{vad.get('threshold', 0.5)}`
+- Min Speech Duration: `{vad.get('min_speech_duration_ms', 250)}ms`
+- Min Silence Duration: `{vad.get('min_silence_duration_ms', 700)}ms`
+
+**Hardware:** GPU (Metal) enabled by default
+"""
+
+    return (
+        status,
+        whisper.get('language', 'en'),
+        whisper.get('threads', 4),
+        vad.get('enabled', False),
+        vad.get('threshold', 0.5),
+        vad.get('min_speech_duration_ms', 250),
+        vad.get('min_silence_duration_ms', 700)
+    )
+
+
+def save_config(language, threads, vad_enabled, vad_threshold, min_speech_ms, min_silence_ms):
+    """Save config to server."""
+    if not check_server_health():
+        return "Error: Server not available"
+
+    try:
+        payload = {
+            "whisper_language": language,
+            "whisper_threads": int(threads),
+            "vad_enabled": vad_enabled,
+            "vad_threshold": float(vad_threshold),
+            "vad_min_speech_duration_ms": int(min_speech_ms),
+            "vad_min_silence_duration_ms": int(min_silence_ms)
+        }
+
+        response = requests.post(
+            f"{API_BASE_URL}/v1/config",
+            json=payload,
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            changes = result.get("changes", [])
+            return f"Config saved successfully.\nChanges: {', '.join(changes)}"
+        else:
+            return f"Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def restart_server():
+    """Restart the ASR server using asr.sh."""
+    try:
+        # Find the project root (where asr.sh is)
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        asr_script = os.path.join(script_dir, "asr.sh")
+
+        if not os.path.exists(asr_script):
+            return "Error: asr.sh not found"
+
+        # Restart just the API server
+        result = subprocess.run(
+            ["bash", asr_script, "restart"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return "Server restarted successfully.\nNote: Gradio UI reconnected."
+        else:
+            return f"Restart failed:\n{result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "Restart timed out"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def transcribe_file(audio_file, language_override=None):
+    """Transcribe uploaded audio file via HTTP API."""
+    if audio_file is None:
+        return "No audio file provided."
+
+    if not check_server_health():
+        return "Error: ASR Server is not running. Start it with: python src/server.py"
+
+    try:
+        with open(audio_file, "rb") as f:
+            files = {"file": (audio_file, f, "audio/wav")}
+            data = {}
+            if language_override and language_override != "default":
+                data["language"] = language_override
+
+            response = requests.post(
+                f"{API_BASE_URL}/v1/audio/transcriptions",
+                files=files,
+                data=data,
+                timeout=60
+            )
+
+        if response.status_code == 200:
+            return response.json().get("text", "")
+        else:
+            return f"Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def transcribe_recording_batch(audio, language_override=None):
+    """Transcribe recorded audio in batch mode via HTTP API."""
+    if audio is None:
+        return "No audio recorded."
+
+    if not check_server_health():
+        return "Error: ASR Server is not running. Start it with: python src/server.py"
+
+    try:
+        sample_rate, audio_data = audio
+
+        # Convert to 16kHz mono if needed
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            num_samples = int(len(audio_data) * 16000 / sample_rate)
+            audio_data = np.interp(
+                np.linspace(0, len(audio_data), num_samples),
+                np.arange(len(audio_data)),
+                audio_data
+            )
+            sample_rate = 16000
+
+        # Normalize and convert to 16-bit PCM
+        audio_data = audio_data.astype(np.float32)
+        audio_data = audio_data / max(np.abs(audio_data).max(), 1e-7)
+        audio_data = (audio_data * 32767).astype(np.int16)
+
+        # Create WAV in memory
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(audio_data.tobytes())
+
+        buffer.seek(0)
+
+        # Send to API
+        files = {"file": ("recording.wav", buffer, "audio/wav")}
+        data = {}
+        if language_override and language_override != "default":
+            data["language"] = language_override
+
+        response = requests.post(
+            f"{API_BASE_URL}/v1/audio/transcriptions",
+            files=files,
+            data=data,
+            timeout=60
+        )
+
+        if response.status_code == 200:
+            return response.json().get("text", "")
+        else:
+            return f"Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+async def transcribe_streaming_async(audio, state):
+    """Stream audio to WebSocket and get transcriptions."""
+    if audio is None:
+        return "No audio recorded.", state
+
+    if not check_server_health():
+        return "Error: ASR Server is not running. Start it with: python src/server.py", state
+
+    try:
+        sample_rate, audio_data = audio
+
+        # Convert to 16kHz mono
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+
+        if sample_rate != 16000:
+            num_samples = int(len(audio_data) * 16000 / sample_rate)
+            audio_data = np.interp(
+                np.linspace(0, len(audio_data), num_samples),
+                np.arange(len(audio_data)),
+                audio_data
+            )
+
+        # Normalize and convert to 16-bit PCM
+        audio_data = audio_data.astype(np.float32)
+        audio_data = audio_data / max(np.abs(audio_data).max(), 1e-7)
+        pcm_data = (audio_data * 32767).astype(np.int16).tobytes()
+
+        transcriptions = []
+
+        async with websockets.connect(WS_URL) as ws:
+            # Send audio in chunks
+            chunk_size = 16000  # 500ms at 16kHz, 16-bit (16000 samples = 32000 bytes / 2)
+            for i in range(0, len(pcm_data), chunk_size * 2):
+                chunk = pcm_data[i:i + chunk_size * 2]
+                await ws.send(chunk)
+
+                # Check for responses (non-blocking)
+                try:
+                    response = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                    msg = json.loads(response)
+                    if msg.get("text"):
+                        transcriptions.append(msg["text"])
+                except asyncio.TimeoutError:
+                    pass
+
+            # Signal end of stream
+            await ws.send("end")
+
+            # Get final transcription
+            try:
+                response = await asyncio.wait_for(ws.recv(), timeout=10)
+                msg = json.loads(response)
+                if msg.get("text"):
+                    transcriptions.append(msg["text"])
+            except asyncio.TimeoutError:
+                pass
+
+        # Combine transcriptions (deduplicate consecutive)
+        result = []
+        for t in transcriptions:
+            if not result or t != result[-1]:
+                result.append(t)
+
+        return " ".join(result) if result else "No speech detected.", state
+
+    except Exception as e:
+        return f"Error: {str(e)}", state
+
+
+def transcribe_streaming(audio, state):
+    """Wrapper to run async streaming in sync context."""
+    return asyncio.run(transcribe_streaming_async(audio, state))
+
+
+def transcribe_recording(audio, mode, language_override, state):
+    """Route to batch or streaming based on mode."""
+    if mode == "Batch":
+        return transcribe_recording_batch(audio, language_override), state
+    else:
+        return transcribe_streaming(audio, state)
+
+
+# Build the Gradio interface
+with gr.Blocks(title="ASR Server Demo") as demo:
+    gr.Markdown(
+        f"""
+        # ASR Server Demo
+        Test speech recognition with file uploads or live recording.
+        [API Documentation]({API_BASE_URL}/docs) | [Health Check]({API_BASE_URL}/health)
+        """
+    )
+
+    with gr.Tabs():
+        # File Upload Tab
+        with gr.TabItem("File Upload"):
+            with gr.Row():
+                file_input = gr.Audio(
+                    label="Upload Audio File",
+                    type="filepath",
+                    sources=["upload"]
+                )
+            with gr.Row():
+                file_lang_override = gr.Dropdown(
+                    choices=[("Use server default", "default")] + LANGUAGES,
+                    value="default",
+                    label="Language (per-request override)",
+                    scale=1
+                )
+            file_transcribe_btn = gr.Button("Transcribe", variant="primary")
+            file_output = gr.Textbox(
+                label="Transcription",
+                lines=5,
+                placeholder="Transcription will appear here..."
+            )
+
+            file_transcribe_btn.click(
+                fn=transcribe_file,
+                inputs=[file_input, file_lang_override],
+                outputs=[file_output]
+            )
+
+        # Live Recording Tab
+        with gr.TabItem("Live Recording"):
+            mode_toggle = gr.Radio(
+                choices=["Batch", "Streaming"],
+                value="Batch",
+                label="Transcription Mode",
+                info="Batch: Record then transcribe | Streaming: Transcribe as you speak"
+            )
+            recording_input = gr.Audio(
+                label="Record Audio",
+                type="numpy",
+                sources=["microphone"]
+            )
+            with gr.Row():
+                rec_lang_override = gr.Dropdown(
+                    choices=[("Use server default", "default")] + LANGUAGES,
+                    value="default",
+                    label="Language (per-request override)",
+                    scale=1
+                )
+            recording_transcribe_btn = gr.Button("Transcribe", variant="primary")
+            recording_output = gr.Textbox(
+                label="Transcription",
+                lines=5,
+                placeholder="Transcription will appear here..."
+            )
+
+            # State for streaming
+            stream_state = gr.State(value={})
+
+            recording_transcribe_btn.click(
+                fn=transcribe_recording,
+                inputs=[recording_input, mode_toggle, rec_lang_override, stream_state],
+                outputs=[recording_output, stream_state]
+            )
+
+        # Settings Tab
+        with gr.TabItem("Settings"):
+            gr.Markdown("### Server Configuration")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    config_status = gr.Markdown("Loading...")
+                    refresh_btn = gr.Button("Refresh Status", variant="secondary")
+
+            gr.Markdown("### Edit Configuration")
+            gr.Markdown("*Changes are applied immediately and saved to config.yaml*")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**Whisper Settings**")
+                    settings_language = gr.Dropdown(
+                        choices=LANGUAGES,
+                        value="en",
+                        label="Default Language"
+                    )
+                    settings_threads = gr.Slider(
+                        minimum=1,
+                        maximum=16,
+                        step=1,
+                        value=4,
+                        label="CPU Threads"
+                    )
+
+                with gr.Column():
+                    gr.Markdown("**VAD Settings**")
+                    settings_vad_enabled = gr.Checkbox(
+                        value=False,
+                        label="Enable Voice Activity Detection"
+                    )
+                    settings_vad_threshold = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=0.5,
+                        label="VAD Threshold (sensitivity)"
+                    )
+                    settings_min_speech = gr.Slider(
+                        minimum=50,
+                        maximum=1000,
+                        step=50,
+                        value=250,
+                        label="Min Speech Duration (ms)"
+                    )
+                    settings_min_silence = gr.Slider(
+                        minimum=100,
+                        maximum=2000,
+                        step=100,
+                        value=700,
+                        label="Min Silence Duration (ms)"
+                    )
+
+            with gr.Row():
+                save_config_btn = gr.Button("Save Configuration", variant="primary")
+                restart_btn = gr.Button("Restart Server", variant="secondary")
+
+            config_result = gr.Textbox(
+                label="Result",
+                lines=2,
+                placeholder="Status messages will appear here..."
+            )
+
+            # Load initial config
+            def load_config_to_ui():
+                return get_config_display()
+
+            refresh_btn.click(
+                fn=load_config_to_ui,
+                outputs=[
+                    config_status,
+                    settings_language,
+                    settings_threads,
+                    settings_vad_enabled,
+                    settings_vad_threshold,
+                    settings_min_speech,
+                    settings_min_silence
+                ]
+            )
+
+            save_config_btn.click(
+                fn=save_config,
+                inputs=[
+                    settings_language,
+                    settings_threads,
+                    settings_vad_enabled,
+                    settings_vad_threshold,
+                    settings_min_speech,
+                    settings_min_silence
+                ],
+                outputs=[config_result]
+            )
+
+            restart_btn.click(
+                fn=restart_server,
+                outputs=[config_result]
+            )
+
+            # Auto-load config on tab load
+            demo.load(
+                fn=load_config_to_ui,
+                outputs=[
+                    config_status,
+                    settings_language,
+                    settings_threads,
+                    settings_vad_enabled,
+                    settings_vad_threshold,
+                    settings_min_speech,
+                    settings_min_silence
+                ]
+            )
+
+    # Status bar
+    gr.Markdown(
+        f"""
+        ---
+        **Note:** Ensure the ASR server is running on `localhost:8005` before testing.
+        """
+    )
+
+
+def main():
+    """Launch the Gradio demo."""
+    print("Starting ASR Server Demo...")
+    print("Make sure the ASR server is running: python src/server.py")
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -12,8 +12,9 @@ models/*.bin
 models/*.onnx
 models/*.mlmodelc/
 
-# Logs
+# Runtime
 logs/
+.pids/
 
 # IDE
 .idea/
