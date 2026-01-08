@@ -304,9 +304,10 @@ async def stream_transcribe(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        await websocket.send_json({"type": "error", "text": str(e)})
-    finally:
-        await websocket.close()
+        try:
+            await websocket.send_json({"type": "error", "text": str(e)})
+        except Exception:
+            pass  # Connection already closed
 
 
 def pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
